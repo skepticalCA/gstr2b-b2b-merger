@@ -1,18 +1,19 @@
 import streamlit as st
 import pandas as pd
 import io
+import zipfile
 
 # --- Page Configuration ---
 st.set_page_config(
-    page_title="GSTR 2B Excel Merger",
-    page_icon="⚙️",
+    page_title="State-Based Excel Merger",
+    page_icon="🗺️",
     layout="centered"
 )
 
 # --- Main Application ---
-st.title("⚙️ Robust Excel File Merger")
+st.title("🗺️ State-Based Excel File Merger")
 st.write("""
-Upload your Excel files. This tool will intelligently find and merge all data sheets from all files, skipping any corrupted sheets and providing a detailed summary of its actions.
+Upload your GSTR-2B Excel files. This tool identifies the state code from each filename (e.g., '36' from '..._36AAACN...'), merges all periods for each state, and bundles the results into a single downloadable .zip file.
 """)
 
 # --- File Uploader ---
@@ -23,17 +24,14 @@ uploaded_files = st.file_uploader(
 )
 
 # --- Merge Button and Logic ---
-if st.button("Merge Files"):
+if st.button("Group and Merge Files by State"):
     if uploaded_files:
-        all_data_frames = []
+        # Use a dictionary to group dataframes by state code
+        data_by_state = {}
         
-        # --- CONFIGURATION BASED ON YOUR CHOICES ---
-        
-        # 1. Flexible Sheet Name Matching: Normalizing to lowercase and stripping spaces.
+        # --- CONFIGURATION ---
         sheets_to_exclude_raw = ["Read me", "ITC Available", "ITC not available", "ITC Reversal", "ITC Rejected"]
         sheets_to_exclude = [name.strip().lower() for name in sheets_to_exclude_raw]
-        
-        # 3. Detailed Logging: List to hold summary messages for the user.
         process_log = []
 
         st.write("Starting merge process...")
@@ -42,83 +40,83 @@ if st.button("Merge Files"):
 
         for i, file in enumerate(uploaded_files):
             sheets_merged_from_this_file = []
-            errors_in_this_file = []
-
             try:
-                # Open the Excel file to inspect its sheets
+                # --- NEW: EXTRACT STATE CODE FROM FILENAME ---
+                parts = file.name.split('_')
+                if len(parts) > 1 and len(parts[1]) >= 2:
+                    state_code = parts[1][:2]
+                else:
+                    process_log.append(f"🟡 **{file.name}:** Skipped. Filename does not follow the expected format '..._STATECODE...'.")
+                    continue # Skip to the next file
+
                 xls = pd.ExcelFile(file)
                 sheet_names = xls.sheet_names
                 
                 for sheet_name in sheet_names:
                     normalized_sheet_name = sheet_name.strip().lower()
-                    
-                    # Check if the normalized sheet name is in our exclusion list
                     if normalized_sheet_name not in sheets_to_exclude:
                         try:
-                            # 2. Robust Error Handling: Try to read each sheet individually.
                             df = pd.read_excel(file, sheet_name=sheet_name, skiprows=4, header=[0, 1])
-                            
-                            # Add trace columns
                             df['Original_Filename'] = file.name
                             df['Original_Sheet_Name'] = sheet_name
                             
-                            all_data_frames.append(df)
+                            # Add the dataframe to the correct state group
+                            if state_code not in data_by_state:
+                                data_by_state[state_code] = []
+                            data_by_state[state_code].append(df)
+                            
                             sheets_merged_from_this_file.append(sheet_name)
-
-                        except Exception as e:
-                            # If a single sheet fails, log it and continue.
-                            errors_in_this_file.append(f"Skipped corrupted/invalid sheet '{sheet_name}' (Error: {e})")
+                        except Exception:
+                            # Silently skip corrupted/invalid sheets within a file, as per previous logic
+                            pass
+                
+                if sheets_merged_from_this_file:
+                    process_log.append(f"🟢 **{file.name}:** Added sheets `{', '.join(sheets_merged_from_this_file)}` to State Group `{state_code}`.")
+                else:
+                    process_log.append(f"⚪️ **{file.name}:** Skipped (no data sheets found).")
 
             except Exception as e:
-                # Handle errors at the file level (e.g., password protected)
-                process_log.append(f"🔴 **{file.name}:** Failed to process entire file. It might be corrupted or password-protected. (Error: {e})")
-
-            # --- LOGGING FOR THE CURRENT FILE ---
-            if sheets_merged_from_this_file:
-                log_entry = f"🟢 **{file.name}:** Merged sheets: `" + "`, `".join(sheets_merged_from_this_file) + "`"
-                if errors_in_this_file:
-                    log_entry += " (and skipped some invalid sheets)"
-                process_log.append(log_entry)
-            elif errors_in_this_file and not sheets_merged_from_this_file:
-                 process_log.append(f"🟡 **{file.name}:** Skipped. Contained only invalid or summary sheets.")
-            else:
-                process_log.append(f"⚪️ **{file.name}:** Skipped (no data sheets found).")
-
+                process_log.append(f"🔴 **{file.name}:** Failed to process entire file. (Error: {e})")
+            
             progress_bar.progress((i + 1) / total_files)
         
-        # --- FINAL STEP: CHECK IF ANY DATA WAS MERGED ---
-        
-        # 4. Handle Empty Results: Only proceed if dataframes were created.
-        if all_data_frames:
-            st.success(f"Merge complete! Successfully processed {len(uploaded_files)} files.")
+        # --- FINAL STEP: PROCESS AND ZIP THE GROUPED DATA ---
+        if data_by_state:
+            st.success(f"Merge complete! Found data for {len(data_by_state)} different states.")
             
-            # Display the detailed process log
             with st.expander("Click to see the detailed processing log"):
                 for entry in process_log:
                     st.markdown(entry)
-            
-            # Concatenate, flatten headers, and prepare for download
-            merged_df = pd.concat(all_data_frames, ignore_index=True)
 
-            if isinstance(merged_df.columns, pd.MultiIndex):
-                merged_df.columns = ['_'.join(map(str, col)).strip() for col in merged_df.columns.values]
-                merged_df.columns = [col.replace('_Unnamed: 1_level_1', '').replace('Unnamed: 0_level_0_', '') for col in merged_df.columns]
+            # Create an in-memory zip file
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                for state_code, df_list in data_by_state.items():
+                    # Merge all dataframes for the current state
+                    state_merged_df = pd.concat(df_list, ignore_index=True)
 
-            output = io.BytesIO()
-            with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                merged_df.to_excel(writer, index=False, sheet_name='Consolidated_Data')
-            
-            processed_data = output.getvalue()
+                    # Flatten headers
+                    if isinstance(state_merged_df.columns, pd.MultiIndex):
+                        state_merged_df.columns = ['_'.join(map(str, col)).strip() for col in state_merged_df.columns.values]
+                        state_merged_df.columns = [col.replace('_Unnamed: 1_level_1', '').replace('Unnamed: 0_level_0_', '') for col in state_merged_df.columns]
+
+                    # Create an in-memory Excel file for the current state
+                    excel_buffer = io.BytesIO()
+                    with pd.ExcelWriter(excel_buffer, engine='xlsxwriter') as writer:
+                        state_merged_df.to_excel(writer, index=False, sheet_name=f'State_{state_code}_Data')
+                    
+                    # Add the in-memory Excel file to the zip archive
+                    excel_buffer.seek(0)
+                    zipf.writestr(f"State_{state_code}_Consolidated.xlsx", excel_buffer.read())
 
             st.download_button(
-                label="📥 Download Consolidated Excel File",
-                data=processed_data,
-                file_name="consolidated_data.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                label="📥 Download All State Files (.zip)",
+                data=zip_buffer.getvalue(),
+                file_name="Statewise_Consolidated_Data.zip",
+                mime="application/zip"
             )
         else:
-            # Display a warning if no data could be merged at all.
-            st.warning("No data sheets found to merge across all uploaded files. Please check your files.")
+            st.warning("No data sheets found to merge across all uploaded files. Please check your files and their naming convention.")
             with st.expander("Click to see the detailed processing log"):
                 for entry in process_log:
                     st.markdown(entry)
